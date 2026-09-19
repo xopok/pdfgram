@@ -26,6 +26,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# Suppress noisy HTTP keep-alive logs from httpx and httpcore
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger("pdfgram")
 
 
@@ -286,7 +290,7 @@ def main():
     logger.info("Starting pdfgram bot...")
     try:
         app = create_bot_app()
-        app.run_polling(drop_pending_updates=True)
+        app.run_polling(timeout=45, drop_pending_updates=True)
     except Exception as e:
         logger.critical(f"Bot failed to start: {e}")
         raise
