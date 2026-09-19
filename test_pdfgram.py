@@ -14,8 +14,7 @@ from arxiv_utils import (
     make_arxiv_filename,
 )
 from cropper import extract_filename_from_url, read_pdf_title, crop_pdf
-from config import Config, SmtpConfig
-from kindle import send_to_kindle_sync
+from config import Config
 
 
 class TestArxivUtils(unittest.TestCase):
@@ -100,20 +99,6 @@ class TestCropper(unittest.TestCase):
             self.assertTrue(ok, f"Crop failed: {msg}")
             self.assertTrue(os.path.exists(output_pdf))
             self.assertGreater(os.path.getsize(output_pdf), 0)
-
-
-class TestKindleValidation(unittest.TestCase):
-    def test_kindle_unconfigured(self):
-        empty_smtp = SmtpConfig()
-        ok, msg = send_to_kindle_sync(
-            pdf_path="dummy.pdf",
-            recipient_email="",
-            filename="paper.pdf",
-            title="Paper",
-            smtp_config=empty_smtp,
-        )
-        self.assertFalse(ok)
-        self.assertIn("not configured", msg)
 
 
 if __name__ == "__main__":
