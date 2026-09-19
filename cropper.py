@@ -9,11 +9,12 @@ import asyncio
 import logging
 from typing import Optional, Tuple
 from urllib.parse import urlparse, unquote
+import urllib.request
 import httpx
 import pypdf
 
 from config import Config
-from arxiv_utils import sanitize_filename
+from arxiv_utils import extract_arxiv_id, sanitize_filename
 
 logger = logging.getLogger("pdfgram")
 
@@ -23,8 +24,16 @@ DOWNLOAD_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "*/*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/pdf,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -54,6 +63,59 @@ def read_pdf_title(pdf_path: str) -> Optional[str]:
     return None
 
 
+def download_with_urllib_sync(
+    url: str,
+    destination_path: str,
+    max_size_mb: int,
+    timeout: float,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Fallback downloader using Python standard library urllib."""
+    max_bytes = max_size_mb * 1024 * 1024
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Accept": "*/*",
+        "Referer": "https://arxiv.org/" if "arxiv.org" in url else url,
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False, f"urllib HTTP {resp.status}", None
+
+            cd = resp.headers.get("Content-Disposition", "")
+            suggested_filename = None
+            if "filename=" in cd:
+                parts = cd.split("filename=")
+                if len(parts) > 1:
+                    fname = parts[1].strip('"\'; ')
+                    if fname:
+                        suggested_filename = sanitize_filename(fname)
+
+            downloaded = 0
+            with open(destination_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        return False, f"File exceeded limit of {max_size_mb} MB", None
+                    f.write(chunk)
+
+        with open(destination_path, "rb") as f:
+            if f.read(5) != b"%PDF-":
+                return False, "Downloaded file missing %PDF header", None
+
+        if not suggested_filename:
+            suggested_filename = extract_filename_from_url(url)
+
+        return True, None, suggested_filename
+
+    except Exception as e:
+        return False, f"urllib error: {str(e)}", None
+
+
 async def download_file(
     url: str,
     destination_path: str,
@@ -62,72 +124,97 @@ async def download_file(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Downloads a PDF file from a URL to destination_path.
-    Includes automatic fallback for arXiv export mirror.
+    Tries canonical URLs, custom headers, and urllib fallback for arXiv resilience.
     Returns: (success, error_message, suggested_filename)
     """
     max_bytes = max_size_mb * 1024 * 1024
     suggested_filename = None
 
-    urls_to_try = [url]
-    if "arxiv.org/pdf/" in url and "export.arxiv.org" not in url:
-        urls_to_try.append(url.replace("arxiv.org/pdf/", "export.arxiv.org/pdf/"))
+    # Construct candidate URLs
+    urls_to_try = []
+    if "arxiv.org" in url:
+        arxiv_id = extract_arxiv_id(url)
+        if arxiv_id:
+            # Canonical arXiv link (without .pdf), then with .pdf, then export mirror
+            urls_to_try.extend([
+                f"https://arxiv.org/pdf/{arxiv_id}",
+                f"https://arxiv.org/pdf/{arxiv_id}.pdf",
+                f"https://export.arxiv.org/pdf/{arxiv_id}",
+                f"https://export.arxiv.org/pdf/{arxiv_id}.pdf",
+            ])
+    if url not in urls_to_try:
+        urls_to_try.append(url)
 
     last_error = None
     for attempt_url in urls_to_try:
+        # Prepare headers tailored for this URL
+        headers = dict(DOWNLOAD_HEADERS)
+        if "arxiv.org" in attempt_url:
+            arxiv_id = extract_arxiv_id(attempt_url)
+            headers["Referer"] = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else "https://arxiv.org/"
+
+        # Method 1: httpx streaming
         try:
-            logger.info(f"Downloading from {attempt_url}...")
+            logger.info(f"Downloading from {attempt_url} via httpx...")
             async with httpx.AsyncClient(
-                headers=DOWNLOAD_HEADERS,
+                headers=headers,
                 follow_redirects=True,
                 timeout=httpx.Timeout(timeout, connect=15.0),
             ) as client:
                 async with client.stream("GET", attempt_url) as response:
-                    if response.status_code != 200:
+                    if response.status_code == 200:
+                        content_disp = response.headers.get("content-disposition", "")
+                        if "filename=" in content_disp:
+                            parts = content_disp.split("filename=")
+                            if len(parts) > 1:
+                                fname = parts[1].strip('"\'; ')
+                                if fname:
+                                    suggested_filename = sanitize_filename(fname)
+
+                        content_len = response.headers.get("content-length")
+                        if content_len and int(content_len) > max_bytes:
+                            return False, f"File size ({int(content_len) // (1024*1024)} MB) exceeds limit ({max_size_mb} MB)", None
+
+                        downloaded = 0
+                        with open(destination_path, "wb") as f:
+                            async for chunk in response.aiter_bytes(chunk_size=65536):
+                                downloaded += len(chunk)
+                                if downloaded > max_bytes:
+                                    return False, f"File exceeded limit of {max_size_mb} MB while downloading", None
+                                f.write(chunk)
+
+                        with open(destination_path, "rb") as f:
+                            if f.read(5) == b"%PDF-":
+                                if not suggested_filename:
+                                    suggested_filename = extract_filename_from_url(attempt_url)
+                                logger.info(f"Successfully downloaded {attempt_url} ({downloaded} bytes via httpx)")
+                                return True, None, suggested_filename
+                            else:
+                                last_error = "Downloaded content is not a valid PDF"
+                                logger.warning(f"{attempt_url}: {last_error}")
+                    else:
                         last_error = f"Server returned HTTP {response.status_code} ({response.reason_phrase})"
-                        logger.warning(f"Download from {attempt_url} failed: {last_error}")
-                        continue
+                        logger.warning(f"httpx download from {attempt_url} failed: {last_error}")
 
-                    # Extract filename from Content-Disposition if present
-                    content_disp = response.headers.get("content-disposition", "")
-                    if "filename=" in content_disp:
-                        parts = content_disp.split("filename=")
-                        if len(parts) > 1:
-                            fname = parts[1].strip('"\'; ')
-                            if fname:
-                                suggested_filename = sanitize_filename(fname)
-
-                    content_len = response.headers.get("content-length")
-                    if content_len and int(content_len) > max_bytes:
-                        return False, f"File size ({int(content_len) // (1024*1024)} MB) exceeds maximum limit ({max_size_mb} MB)", None
-
-                    downloaded = 0
-                    with open(destination_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=65536):
-                            downloaded += len(chunk)
-                            if downloaded > max_bytes:
-                                return False, f"File exceeded maximum limit of {max_size_mb} MB while downloading", None
-                            f.write(chunk)
-
-            # Validate that the downloaded file is indeed a PDF (check magic bytes %PDF-)
-            with open(destination_path, "rb") as f:
-                header = f.read(5)
-                if header != b"%PDF-":
-                    last_error = "Downloaded file does not appear to be a valid PDF (missing %PDF header)"
-                    logger.warning(f"{attempt_url}: {last_error}")
-                    continue
-
-            if not suggested_filename:
-                suggested_filename = extract_filename_from_url(url)
-
-            logger.info(f"Successfully downloaded {attempt_url} ({downloaded} bytes)")
-            return True, None, suggested_filename
-
-        except httpx.TimeoutException:
-            last_error = f"Download timed out after {timeout} seconds"
-            logger.warning(f"{attempt_url}: {last_error}")
         except Exception as e:
-            last_error = f"Download error: {str(e)}"
-            logger.warning(f"{attempt_url}: {last_error}")
+            last_error = f"httpx error: {str(e)}"
+            logger.warning(f"httpx error for {attempt_url}: {last_error}")
+
+        # Method 2: Fallback to urllib
+        logger.info(f"Trying urllib fallback for {attempt_url}...")
+        u_ok, u_err, u_fname = await asyncio.to_thread(
+            download_with_urllib_sync,
+            attempt_url,
+            destination_path,
+            max_size_mb,
+            timeout,
+        )
+        if u_ok:
+            logger.info(f"Successfully downloaded {attempt_url} via urllib")
+            return True, None, u_fname or suggested_fname or extract_filename_from_url(attempt_url)
+        else:
+            last_error = u_err
+            logger.warning(f"urllib fallback for {attempt_url} failed: {u_err}")
 
     logger.error(f"All download attempts failed for {url}: {last_error}")
     return False, last_error or "Download failed", None

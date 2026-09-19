@@ -35,7 +35,7 @@ class TestArxivUtils(unittest.TestCase):
                 self.assertEqual(extract_arxiv_id(url), expected)
 
     def test_get_arxiv_pdf_url(self):
-        self.assertEqual(get_arxiv_pdf_url("2309.19101v1"), "https://arxiv.org/pdf/2309.19101v1.pdf")
+        self.assertEqual(get_arxiv_pdf_url("2309.19101v1"), "https://arxiv.org/pdf/2309.19101v1")
 
     def test_sanitize_filename(self):
         dirty = "Monitoring and Discovering Reward Hacking with / \\ : * ? < > | Newlines\n\r"

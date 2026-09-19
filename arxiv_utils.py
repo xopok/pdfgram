@@ -50,8 +50,8 @@ def extract_arxiv_id(text: str) -> Optional[str]:
 
 
 def get_arxiv_pdf_url(arxiv_id: str) -> str:
-    """Returns the direct PDF download URL for a given arXiv ID."""
-    return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    """Returns the canonical direct PDF download URL for a given arXiv ID."""
+    return f"https://arxiv.org/pdf/{arxiv_id}"
 
 
 def sanitize_filename(name: str, max_length: int = 180) -> str:
