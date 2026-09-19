@@ -26,7 +26,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# Suppress noisy HTTP keep-alive logs from httpx and httpcore
+# Suppress noisy HTTP keep-alive pings from httpx and httpcore
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -47,6 +47,7 @@ async def auth_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
     if not user:
         return False
     if not is_authorized(user.id, config):
+        logger.warning(f"Unauthorized access attempt by user {user.id} (@{user.username})")
         if update.message:
             await update.message.reply_text("⛔ Access denied: You are not authorized to use this bot.")
         return False
@@ -58,6 +59,9 @@ async def command_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await auth_check(update, context):
         return
 
+    user = update.effective_user
+    logger.info(f"User {user.id} (@{user.username}) invoked /start or /help")
+
     msg = (
         "👋 *Welcome to pdfgram!*\n\n"
         "Send me a link to an **arXiv paper** or any **PDF file**, and I will:\n"
@@ -66,7 +70,7 @@ async def command_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "3. Rename arXiv papers with their ID and paper title\n"
         "4. Send the cropped document right back to you here!\n\n"
         "📚 *Usage:*\n"
-        "• Send an arXiv link: `https://arxiv.org/abs/1706.03762`\n"
+        "• Send an arXiv link: `https://arxiv.org/abs/2609.19101` (or `/pdf/`)\n"
         "• Send any PDF link: `https://example.com/paper.pdf`\n"
         "• Or directly upload a PDF document into the chat\n\n"
         "⚙️ *Commands:*\n"
@@ -82,6 +86,9 @@ async def command_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     config: Config = context.bot_data["config"]
+    user = update.effective_user
+    logger.info(f"User {user.id} (@{user.username}) invoked /status")
+
     msg = (
         "⚙️ *pdfgram Bot Settings*\n\n"
         f"• *Crop Margin Retain:* `{config.crop_percent}%`\n"
@@ -100,7 +107,10 @@ async def process_pdf_job(
 ) -> None:
     """Core workflow for fetching, cropping, and returning a PDF."""
     config: Config = context.bot_data["config"]
+    user = update.effective_user
     chat_id = update.effective_chat.id
+
+    logger.info(f"Processing PDF request from user {user.id} (@{user.username}): {target_url}")
 
     # Step 1: Detect arXiv vs generic PDF
     arxiv_id = extract_arxiv_id(target_url)
@@ -111,16 +121,20 @@ async def process_pdf_job(
 
     if arxiv_id:
         download_url = get_arxiv_pdf_url(arxiv_id)
+        logger.info(f"Identified arXiv paper: {arxiv_id}, resolved download URL: {download_url}")
         await status_msg.edit_text(f"📄 *Detected arXiv paper:* `{arxiv_id}`\n⏳ Fetching metadata...", parse_mode=ParseMode.MARKDOWN)
         arxiv_title, _ = await fetch_arxiv_metadata(arxiv_id)
         if arxiv_title:
+            logger.info(f"ArXiv title for {arxiv_id}: {arxiv_title!r}")
             await status_msg.edit_text(
                 f"📄 *arXiv:* `{arxiv_id}`\n📌 *Title:* {arxiv_title}\n⏳ Downloading PDF document...",
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
+            logger.info(f"Could not fetch metadata for {arxiv_id}, continuing with ID only.")
             await status_msg.edit_text(f"📄 *arXiv:* `{arxiv_id}`\n⏳ Downloading PDF document...", parse_mode=ParseMode.MARKDOWN)
     else:
+        logger.info(f"Treating as standard PDF URL: {target_url}")
         await status_msg.edit_text("📄 *PDF link detected.*\n⏳ Downloading document...", parse_mode=ParseMode.MARKDOWN)
 
     # Step 2: Download PDF to temporary directory
@@ -137,6 +151,7 @@ async def process_pdf_job(
         )
 
         if not ok:
+            logger.error(f"Download failed for {download_url}: {error_msg}")
             await status_msg.edit_text(f"❌ *Download failed:*\n{error_msg}", parse_mode=ParseMode.MARKDOWN)
             return
 
@@ -155,6 +170,7 @@ async def process_pdf_job(
                 final_filename = "document_cropped.pdf"
 
         # Step 3: Crop margins
+        logger.info(f"Starting margin cropping: {final_filename} (retain: {config.crop_percent}%)")
         await status_msg.edit_text(
             f"✂️ *Cropping margins with pdfCropMargins...*\nRetaining {config.crop_percent}% margin space.",
             parse_mode=ParseMode.MARKDOWN,
@@ -167,10 +183,12 @@ async def process_pdf_job(
         )
 
         if not crop_ok:
+            logger.error(f"Margin cropping failed for {final_filename}: {crop_msg}")
             await status_msg.edit_text(f"❌ *Cropping error:*\n{crop_msg}", parse_mode=ParseMode.MARKDOWN)
             return
 
         # Step 4: Send cropped document back to chat
+        logger.info(f"Uploading cropped file {final_filename} to chat {chat_id}...")
         await status_msg.edit_text("📤 *Uploading cropped document...*", parse_mode=ParseMode.MARKDOWN)
         try:
             with open(cropped_pdf_path, "rb") as doc_file:
@@ -182,8 +200,9 @@ async def process_pdf_job(
                     parse_mode=ParseMode.MARKDOWN,
                 )
             await status_msg.delete()
+            logger.info(f"Successfully sent {final_filename} to user {user.id}")
         except Exception as e:
-            logger.exception("Failed to upload document to Telegram")
+            logger.exception(f"Failed to upload document {final_filename} to Telegram")
             await status_msg.edit_text(f"❌ Failed to upload document: {str(e)}")
 
 
@@ -192,7 +211,10 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await auth_check(update, context):
         return
 
+    user = update.effective_user
     text = update.message.text or ""
+    logger.info(f"Received text message from user {user.id} (@{user.username}): {text!r}")
+
     url_match = re.search(r'https?://[^\s]+', text)
     if not url_match:
         # Check if message is a bare arXiv ID
@@ -202,10 +224,12 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await process_pdf_job(target_url, update, context)
             return
 
+        logger.info(f"No valid URL or arXiv ID found in message from user {user.id}")
         await update.message.reply_text(
             "Please send a valid PDF link or an arXiv paper URL.\n\n"
             "Examples:\n"
-            "• `https://arxiv.org/abs/1706.03762`\n"
+            "• `https://arxiv.org/abs/2609.19101`\n"
+            "• `https://arxiv.org/pdf/2609.19101.pdf`\n"
             "• `https://example.com/paper.pdf`",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -220,9 +244,12 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
     if not await auth_check(update, context):
         return
 
+    user = update.effective_user
     document = update.message.document
     if not document or not document.file_name:
         return
+
+    logger.info(f"Received document upload from user {user.id} (@{user.username}): {document.file_name} ({document.file_size} bytes)")
 
     if not document.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("Please upload a PDF document.")
@@ -246,6 +273,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             await status_msg.edit_text("✂️ Cropping margins...", parse_mode=ParseMode.MARKDOWN)
             crop_ok, crop_msg = await crop_pdf(input_pdf_path, cropped_pdf_path, config)
             if not crop_ok:
+                logger.error(f"Cropping failed for uploaded file {document.file_name}: {crop_msg}")
                 await status_msg.edit_text(f"❌ Cropping error: {crop_msg}")
                 return
 
@@ -261,6 +289,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                     parse_mode=ParseMode.MARKDOWN,
                 )
             await status_msg.delete()
+            logger.info(f"Successfully processed and sent uploaded PDF {final_filename} to user {user.id}")
 
         except Exception as e:
             logger.exception("Error processing uploaded document")

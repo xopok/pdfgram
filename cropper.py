@@ -15,15 +15,16 @@ import pypdf
 from config import Config
 from arxiv_utils import sanitize_filename
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("pdfgram")
 
 DOWNLOAD_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36 pdfgram-bot/1.0"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/pdf,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -46,7 +47,6 @@ def read_pdf_title(pdf_path: str) -> Optional[str]:
         meta = reader.metadata
         if meta and meta.title:
             title = meta.title.strip()
-            # Some titles are filled with 'untitled' or empty placeholders
             if len(title) > 2 and not title.lower().startswith("untitled"):
                 return sanitize_filename(title, max_length=150)
     except Exception as e:
@@ -62,58 +62,75 @@ async def download_file(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Downloads a PDF file from a URL to destination_path.
+    Includes automatic fallback for arXiv export mirror.
     Returns: (success, error_message, suggested_filename)
     """
     max_bytes = max_size_mb * 1024 * 1024
     suggested_filename = None
 
-    try:
-        async with httpx.AsyncClient(
-            headers=DOWNLOAD_HEADERS,
-            follow_redirects=True,
-            timeout=httpx.Timeout(timeout, connect=15.0),
-        ) as client:
-            async with client.stream("GET", url) as response:
-                if response.status_code != 200:
-                    return False, f"Server returned HTTP {response.status_code} ({response.reason_phrase})", None
+    urls_to_try = [url]
+    if "arxiv.org/pdf/" in url and "export.arxiv.org" not in url:
+        urls_to_try.append(url.replace("arxiv.org/pdf/", "export.arxiv.org/pdf/"))
 
-                # Extract filename from Content-Disposition if present
-                content_disp = response.headers.get("content-disposition", "")
-                if "filename=" in content_disp:
-                    parts = content_disp.split("filename=")
-                    if len(parts) > 1:
-                        fname = parts[1].strip('"\'; ')
-                        if fname:
-                            suggested_filename = sanitize_filename(fname)
+    last_error = None
+    for attempt_url in urls_to_try:
+        try:
+            logger.info(f"Downloading from {attempt_url}...")
+            async with httpx.AsyncClient(
+                headers=DOWNLOAD_HEADERS,
+                follow_redirects=True,
+                timeout=httpx.Timeout(timeout, connect=15.0),
+            ) as client:
+                async with client.stream("GET", attempt_url) as response:
+                    if response.status_code != 200:
+                        last_error = f"Server returned HTTP {response.status_code} ({response.reason_phrase})"
+                        logger.warning(f"Download from {attempt_url} failed: {last_error}")
+                        continue
 
-                content_len = response.headers.get("content-length")
-                if content_len and int(content_len) > max_bytes:
-                    return False, f"File size ({int(content_len) // (1024*1024)} MB) exceeds maximum limit ({max_size_mb} MB)", None
+                    # Extract filename from Content-Disposition if present
+                    content_disp = response.headers.get("content-disposition", "")
+                    if "filename=" in content_disp:
+                        parts = content_disp.split("filename=")
+                        if len(parts) > 1:
+                            fname = parts[1].strip('"\'; ')
+                            if fname:
+                                suggested_filename = sanitize_filename(fname)
 
-                downloaded = 0
-                with open(destination_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=65536):
-                        downloaded += len(chunk)
-                        if downloaded > max_bytes:
-                            return False, f"File exceeded maximum limit of {max_size_mb} MB while downloading", None
-                        f.write(chunk)
+                    content_len = response.headers.get("content-length")
+                    if content_len and int(content_len) > max_bytes:
+                        return False, f"File size ({int(content_len) // (1024*1024)} MB) exceeds maximum limit ({max_size_mb} MB)", None
 
-        # Validate that the downloaded file is indeed a PDF (check magic bytes %PDF-)
-        with open(destination_path, "rb") as f:
-            header = f.read(5)
-            if header != b"%PDF-":
-                return False, "Downloaded file does not appear to be a valid PDF (missing %PDF header)", None
+                    downloaded = 0
+                    with open(destination_path, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=65536):
+                            downloaded += len(chunk)
+                            if downloaded > max_bytes:
+                                return False, f"File exceeded maximum limit of {max_size_mb} MB while downloading", None
+                            f.write(chunk)
 
-        if not suggested_filename:
-            suggested_filename = extract_filename_from_url(url)
+            # Validate that the downloaded file is indeed a PDF (check magic bytes %PDF-)
+            with open(destination_path, "rb") as f:
+                header = f.read(5)
+                if header != b"%PDF-":
+                    last_error = "Downloaded file does not appear to be a valid PDF (missing %PDF header)"
+                    logger.warning(f"{attempt_url}: {last_error}")
+                    continue
 
-        return True, None, suggested_filename
+            if not suggested_filename:
+                suggested_filename = extract_filename_from_url(url)
 
-    except httpx.TimeoutException:
-        return False, f"Download timed out after {timeout} seconds", None
-    except Exception as e:
-        logger.exception(f"Failed to download {url}")
-        return False, f"Download error: {str(e)}", None
+            logger.info(f"Successfully downloaded {attempt_url} ({downloaded} bytes)")
+            return True, None, suggested_filename
+
+        except httpx.TimeoutException:
+            last_error = f"Download timed out after {timeout} seconds"
+            logger.warning(f"{attempt_url}: {last_error}")
+        except Exception as e:
+            last_error = f"Download error: {str(e)}"
+            logger.warning(f"{attempt_url}: {last_error}")
+
+    logger.error(f"All download attempts failed for {url}: {last_error}")
+    return False, last_error or "Download failed", None
 
 
 async def crop_pdf(
