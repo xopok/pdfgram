@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+pdfCropMargins>=2.2.0
+httpx>=0.27.0
+pypdf>=5.0.0
+python-dotenv>=1.0.0
