@@ -1,17 +1,22 @@
 FROM python:3.11-slim
 
-# Install system dependencies required by pdfCropMargins (poppler-utils for pdftoppm, ghostscript)
+# Install system dependencies required by pdfCropMargins and git
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     ghostscript \
     ca-certificates \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Install python dependencies
-COPY requirements.txt .
+# Clone repository from GitHub
+ARG REPO_URL=https://github.com/xopok/pdfgram.git
+ARG BRANCH=main
+RUN git clone --depth 1 --branch ${BRANCH} ${REPO_URL} .
+
+# Install python dependencies from the cloned repo
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
@@ -19,9 +24,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /app/data && \
     chown -R appuser:appuser /app
-
-# Copy application files
-COPY --chown=appuser:appuser . .
 
 USER appuser
 
